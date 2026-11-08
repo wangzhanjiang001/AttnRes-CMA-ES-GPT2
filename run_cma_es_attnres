@@ -139,7 +139,7 @@ x0 = default_x
 sigma0 = 0.2
 
 opts = {
-    'popsize': 100,
+    'popsize': 10,
     'bounds': [-3.0, 3.0],
     'verbose': -1
 }
