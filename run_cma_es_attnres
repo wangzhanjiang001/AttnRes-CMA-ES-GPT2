@@ -1,0 +1,173 @@
+"""
+Gradient-Free Dynamic Attention Residual Routing for GPT-2 via CMA-ES
+Author: Zhanjiang Wang
+Email: wangzhanjiang001@gmail.com
+Description: Optimizes 24-dimensional residual scaling factors for a 12-layer GPT-2
+model using CMA-ES to mitigate depth dilution, without modifying backbone weights.
+"""
+
+import time
+import torch
+import torch.nn as nn
+from transformers import GPT2Tokenizer, GPT2LMHeadModel
+import cma
+import numpy as np
+
+# ==========================================
+# 0. Environment and Device Check
+# ==========================================
+device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+print(f"🚀 Using device: {device}")
+
+# ==========================================
+# 1. Load Pre-trained Model and Tokenizer
+# ==========================================
+model_name = "gpt2"  # GPT-2 Small: 12 layers, 768 dim, ~124M parameters
+print(f"📦 Loading pre-trained model ({model_name})...")
+
+tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+base_model = GPT2LMHeadModel.from_pretrained(model_name).to(device)
+
+# Core: Completely freeze the parameters of the pre-trained backbone
+for param in base_model.parameters():
+    param.requires_grad = False
+
+num_layers = base_model.config.n_layer  # GPT-2 Small has 12 layers
+
+# ==========================================
+# 2. Prepare Evaluation Dataset (Tiny Shakespeare)
+# ==========================================
+raw_text = """
+First Citizen:
+Before we proceed any further, hear me speak.
+
+All:
+Speak, speak.
+
+First Citizen:
+You are all resolved rather to die than to famish?
+
+All:
+Resolved. resolved.
+
+First Citizen:
+First, you know Caius Marcius is chief enemy to the people.
+""" * 5
+
+# Tokenize inputs
+inputs = tokenizer(raw_text, return_tensors="pt").input_ids.to(device)
+input_ids = inputs[:, :-1]
+target_ids = inputs[:, 1:]
+
+criterion = nn.CrossEntropyLoss()
+
+
+# ==========================================
+# 3. Dynamic Residual Control Hook Wrapper
+# ==========================================
+class DynamicResidualGPT2(nn.Module):
+    def __init__(self, model, num_layers):
+        super().__init__()
+        self.model = model
+        self.num_layers = num_layers
+
+    def forward(self, input_ids, cma_vector):
+        # CMA vector parsing:
+        # First num_layers parameters: Residual scaling alpha for each block output
+        # Last num_layers parameters: Cross-layer historical Softmax fusion weights
+        alphas = cma_vector[: self.num_layers]
+        history_raw = cma_vector[self.num_layers:]
+        history_weights = torch.softmax(torch.tensor(history_raw, device=input_ids.device, dtype=torch.float32), dim=0)
+
+        # Collect output features from each layer
+        layer_outputs = []
+
+        # Get Word Embedding output
+        hidden_states = self.model.transformer.wte(input_ids) + self.model.transformer.wpe(
+            torch.arange(0, input_ids.size(1), device=input_ids.device)
+        )
+        hidden_states = self.model.transformer.drop(hidden_states)
+
+        # Pass through Transformer blocks sequentially and inject CMA residuals
+        for i, block in enumerate(self.model.transformer.h):
+            alpha = alphas[i]
+            # Standard output
+            block_out = block(hidden_states)[0]
+            # Inject CMA-ES tuning residual: h_new = h_old + alpha * block_output
+            hidden_states = hidden_states + alpha * block_out
+            layer_outputs.append(hidden_states)
+
+        # Multi-path historical feature Softmax weighted fusion (Depth-wise Information Routing)
+        fused_hidden = torch.zeros_like(hidden_states)
+        for i, out in enumerate(layer_outputs):
+            fused_hidden = fused_hidden + history_weights[i] * out
+
+        # Layer normalization and LM Head projection
+        fused_hidden = self.model.transformer.ln_f(fused_hidden)
+        logits = self.model.lm_head(fused_hidden)
+        return logits
+
+
+wrapper_model = DynamicResidualGPT2(base_model, num_layers).to(device)
+
+
+# ==========================================
+# 4. Fitness Evaluation Function
+# ==========================================
+def evaluate_fitness(cma_vector):
+    wrapper_model.eval()
+    with torch.no_grad():
+        try:
+            logits = wrapper_model(input_ids, cma_vector)
+            loss = criterion(logits.view(-1, logits.size(-1)), target_ids.view(-1))
+            return loss.item()
+        except Exception as e:
+            return 1e5
+
+
+# Calculate standard baseline Loss (all residual alphas=1.0, uniform fusion weights)
+default_x = [1.0] * num_layers + [0.0] * num_layers
+baseline_loss = evaluate_fitness(default_x)
+print(f"📊 Pre-trained Model Default Standard Residual (Baseline) Loss: {baseline_loss:.4f}\n")
+
+# ==========================================
+# 5. Launch CMA-ES Architecture Search
+# ==========================================
+# 12 layers * 2 = 24-dimensional search space
+param_dim = num_layers * 2
+x0 = default_x
+sigma0 = 0.2
+
+opts = {
+    'popsize': 10,
+    'bounds': [-3.0, 3.0],
+    'verbose': -1
+}
+es = cma.CMAEvolutionStrategy(x0, sigma0, opts)
+
+print(f"🎯 Starting CMA-ES residual architecture search for GPT-2 (12 layers, 24 dims)...\n")
+start_time = time.time()
+
+generations = 15
+for gen in range(generations):
+    solutions = es.ask()
+    fitnesses = [evaluate_fitness(s) for s in solutions]
+    es.tell(solutions, fitnesses)
+
+    print(
+        f"Gen {gen + 1:02d}/{generations} | Best Loss: {es.result.fbest:.4f} (Improvement over Baseline: {baseline_loss - es.result.fbest:.4f})")
+
+end_time = time.time()
+print(f"\n🎉 Search completed! Elapsed time: {end_time - start_time:.2f} seconds")
+print("=" * 60)
+print("🏆 Optimal Residual and Fusion Parameters Found (xbest):")
+best_params = es.result.xbest
+print(np.round(best_params, 4))
+
+# Parse layer-wise dynamic residual Alpha and historical Softmax proportions
+alphas = best_params[:num_layers]
+hist_weights = torch.softmax(torch.tensor(best_params[num_layers:]), dim=0).numpy()
+
+print("\n📊 GPT-2 Layer-wise Dynamic Fusion Ratio Analysis:")
+for i in range(num_layers):
+    print(f"Layer {i + 1:02d}: Residual Alpha={alphas[i]:.3f} | Historical Weight Share={hist_weights[i] * 100:.1f}%")
